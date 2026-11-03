@@ -15,7 +15,7 @@ use std::hash::{Hash, Hasher};
 
 use crate::gpu::{Frame, GpuScene, GpuTarget, SceneSlot, ViewportCallback};
 use crate::navigation::{CameraInput, NavCaps, orbit_drag};
-use crate::selection::{BoxSel, origin_quads, origin_size, ray_quad};
+use crate::selection::{BoxSel, origin_size, ray_quad};
 use crate::theme::Tokens;
 use crate::{SolveApp, icons};
 
@@ -537,6 +537,27 @@ fn picture_far(app: &SolveApp, cam: &Camera) -> f64 {
 pub(crate) fn visible_sketches(app: &SolveApp) -> Vec<u64> {
     let st = crate::open_meshing::shown_world(app);
     st.sketches.iter().filter(|s| solidcraft_engine::view::sketch_shown(&app.session, s.feature)).map(|s| s.feature).collect()
+}
+
+/// The bounding box of the active component's shown bodies, or the whole view bounds when at root.
+pub fn active_bounds(app: &SolveApp) -> solidcraft_engine::geom::Aabb3 {
+    let s = &app.session;
+    if s.active_component != 0 {
+        let st = crate::open_meshing::shown_world(app);
+        let bounds = body_bounds(app, &st);
+        let mut b = solidcraft_engine::geom::Aabb3::EMPTY;
+        for (i, body) in st.bodies.iter().enumerate() {
+            if s.doc.component_within(body.component, s.active_component) && app.body_visible(&body.name) {
+                if let Some((_, bb)) = bounds.get(i) {
+                    b = b.union(bb);
+                }
+            }
+        }
+        if !b.is_empty() {
+            return b;
+        }
+    }
+    view_bounds(app)
 }
 
 /// What Home, Fit and the orbit pivot frame: the bodies and sketches shown now, where they are
@@ -2185,10 +2206,30 @@ pub fn origin_planes(app: &SolveApp) -> Vec<(&'static str, Vec3, [Vec3; 4])> {
     if !app.origin_shown() && !reveal {
         return Vec::new();
     }
-    origin_quads(origin_size(app.cam.half_height()))
-        .into_iter()
-        .filter(|(n, _, _)| reveal || !app.session.visibility.hidden_origin.iter().any(|h| h == n))
-        .collect()
+    let default_size = origin_size(app.cam.half_height());
+    let bb = active_bounds(app);
+
+    let (sx, sy, sz) = if !bb.is_empty() {
+        let sz = bb.size();
+        let max_dim = sz.x.max(sz.y).max(sz.z);
+        let fitted = (max_dim * 0.45).clamp(default_size * 0.75, default_size * 1.5);
+        (
+            (sz.x * 0.5).clamp(default_size * 0.75, fitted),
+            (sz.y * 0.5).clamp(default_size * 0.75, fitted),
+            (sz.z * 0.5).clamp(default_size * 0.75, fitted),
+        )
+    } else {
+        (default_size, default_size, default_size)
+    };
+
+    let o = Vec3::ZERO;
+    let quads: [(&'static str, Vec3, [Vec3; 4]); 3] = [
+        ("XY", Vec3::Z, [o, o + Vec3::X * sx, o + Vec3::X * sx + Vec3::Y * sy, o + Vec3::Y * sy]),
+        ("XZ", Vec3::Y, [o, o + Vec3::Z * sz, o + Vec3::X * sx + Vec3::Z * sz, o + Vec3::X * sx]),
+        ("YZ", Vec3::X, [o, o + Vec3::Y * sy, o + Vec3::Y * sy + Vec3::Z * sz, o + Vec3::Z * sz]),
+    ];
+
+    quads.into_iter().filter(|(n, _, _)| reveal || !app.session.visibility.hidden_origin.iter().any(|h| h == n)).collect()
 }
 
 /// The plane Create Sketch would put the sketch on: the origin or construction plane under the
@@ -2255,7 +2296,7 @@ pub fn construction_axis_segments(app: &SolveApp) -> Vec<(String, Vec3, Vec3)> {
     if axes.is_empty() {
         return Vec::new();
     }
-    let bb = view_bounds(app);
+    let bb = active_bounds(app);
     axes.into_iter()
         .map(|(_, name, o, d)| {
             let (a, b) = axis_span(app, &bb, o, d);
@@ -2333,17 +2374,209 @@ pub fn construction_points(app: &SolveApp) -> Vec<(String, Vec3)> {
         .collect()
 }
 
-/// Construction planes drawn as squares around their origin: (name, normal, quad).
+/// Four corners of a quad on `pl` enclosing the projected 3D bounding box `[min, max]`, with margin.
+fn fit_plane_to_bbox(pl: &Plane, min: Vec3, max: Vec3, margin: f64, fallback_half_size: f64) -> [Vec3; 4] {
+    let h = fallback_half_size;
+    let (mut u_min, mut u_max) = (-h, h);
+    let (mut v_min, mut v_max) = (-h, h);
+    if max.x > min.x || max.y > min.y || max.z > min.z {
+        let pad = (h * 0.2).max(margin);
+        for i in 0..8 {
+            let c = Vec3::new(if i & 1 == 0 { min.x } else { max.x }, if i & 2 == 0 { min.y } else { max.y }, if i & 4 == 0 { min.z } else { max.z });
+            let uv = pl.to_local(c);
+            u_min = u_min.min(uv.x - pad);
+            u_max = u_max.max(uv.x + pad);
+            v_min = v_min.min(uv.y - pad);
+            v_max = v_max.max(uv.y + pad);
+        }
+    }
+    [
+        pl.to_world(Vec2::new(u_min, v_min)),
+        pl.to_world(Vec2::new(u_max, v_min)),
+        pl.to_world(Vec2::new(u_max, v_max)),
+        pl.to_world(Vec2::new(u_min, v_max)),
+    ]
+}
+
+/// Construction planes drawn as quads fitted to the component bounds: (name, normal, quad).
 pub fn construction_quads(app: &SolveApp) -> Vec<(String, Vec3, [Vec3; 4])> {
     let h = origin_size(app.cam.half_height()) * 1.2;
+    let bb = active_bounds(app);
     solidcraft_engine::view::construction_planes(&app.session)
         .into_iter()
         .filter(|(_, n, _)| app.session.construction_visible(n))
         .map(|(_, name, pl)| {
-            let (o, x, y) = (pl.origin, pl.x * h, pl.y * h);
-            (name, pl.normal(), [o - x - y, o + x - y, o + x + y, o - x + y])
+            let quad = if !bb.is_empty() {
+                fit_plane_to_bbox(&pl, bb.min, bb.max, h * 0.2, h)
+            } else {
+                let (o, x, y) = (pl.origin, pl.x * h, pl.y * h);
+                [o - x - y, o + x - y, o + x + y, o - x + y]
+            };
+            (name, pl.normal(), quad)
         })
         .collect()
+}
+
+/// Checks whether a component's origin folder or a specific origin item is hidden in the browser.
+fn component_origin_item_hidden(s: &solidcraft_engine::Session, comp_id: u64, occ_name: &str, item: Option<&str>) -> bool {
+    let folder_c = format!("c{comp_id}/origin");
+    let folder_occ = format!("{occ_name}/origin");
+
+    let folder_hidden = s.folder_hidden(&folder_c)
+        || s.folder_hidden(&folder_occ)
+        || s.visibility.hidden_folders.iter().any(|f| {
+            f.eq_ignore_ascii_case(&folder_c)
+                || f.eq_ignore_ascii_case(&folder_occ)
+                || (f.ends_with("/origin") && (f.contains(&format!("c{comp_id}")) || f.contains(occ_name)))
+        });
+
+    if folder_hidden {
+        return true;
+    }
+
+    if let Some(item_name) = item {
+        let tag_c = format!("c{comp_id}/{item_name}");
+        let tag_occ = format!("{occ_name}/{item_name}");
+        s.visibility
+            .hidden_origin
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(&tag_c) || h.eq_ignore_ascii_case(&tag_occ) || (comp_id == 0 && h.eq_ignore_ascii_case(item_name)))
+    } else {
+        false
+    }
+}
+
+/// Component origin planes fitted strictly within each component's bounding volume: (name, quad, color).
+pub fn component_origin_quads(app: &SolveApp) -> Vec<(String, [Vec3; 4], Color32)> {
+    let s = &app.session;
+    let doc = s.placed_document();
+    let st = crate::open_meshing::shown_world(app);
+    let t = Tokens::get();
+    let default_h = origin_size(app.cam.half_height()) * 0.8;
+    let mut out = Vec::new();
+
+    for (comp_id, path, mat) in doc.placements() {
+        if path.is_empty() {
+            continue; // Root design origin is handled by origin_planes()
+        }
+
+        let Some(&leaf_occ_id) = path.last() else { continue };
+        let occ_name = doc.occurrences.iter().find(|o| o.id == leaf_occ_id).map(|o| o.name.as_str()).unwrap_or("");
+
+        if component_origin_item_hidden(s, comp_id, occ_name, None) {
+            continue;
+        }
+
+        // Compute local component bounding box from bodies
+        let mut local_bb = solidcraft_engine::geom::Aabb3::EMPTY;
+        for b in st.bodies.iter().filter(|b| b.component == comp_id) {
+            let (m, _) = b.mesh_in_place();
+            local_bb = local_bb.union(&m.bounds());
+        }
+
+        let (min, max) = if !local_bb.is_empty() {
+            (local_bb.min, local_bb.max)
+        } else {
+            (Vec3::new(-default_h, -default_h, -default_h), Vec3::new(default_h, default_h, default_h))
+        };
+
+        let at = |p: Vec3| solidcraft_engine::doc::apply_point(&mat, p);
+
+        // XY plane at Z = 0
+        if !component_origin_item_hidden(s, comp_id, occ_name, Some("XY")) {
+            let quad = [
+                at(Vec3::new(min.x, min.y, 0.0)),
+                at(Vec3::new(max.x, min.y, 0.0)),
+                at(Vec3::new(max.x, max.y, 0.0)),
+                at(Vec3::new(min.x, max.y, 0.0)),
+            ];
+            let name = if occ_name.is_empty() { "XY".into() } else { format!("{occ_name}/XY") };
+            out.push((name, quad, t.origin_plane));
+        }
+
+        // XZ plane at Y = 0
+        if !component_origin_item_hidden(s, comp_id, occ_name, Some("XZ")) {
+            let quad = [
+                at(Vec3::new(min.x, 0.0, min.z)),
+                at(Vec3::new(max.x, 0.0, min.z)),
+                at(Vec3::new(max.x, 0.0, max.z)),
+                at(Vec3::new(min.x, 0.0, max.z)),
+            ];
+            let name = if occ_name.is_empty() { "XZ".into() } else { format!("{occ_name}/XZ") };
+            out.push((name, quad, t.origin_plane));
+        }
+
+        // YZ plane at X = 0
+        if !component_origin_item_hidden(s, comp_id, occ_name, Some("YZ")) {
+            let quad = [
+                at(Vec3::new(0.0, min.y, min.z)),
+                at(Vec3::new(0.0, max.y, min.z)),
+                at(Vec3::new(0.0, max.y, max.z)),
+                at(Vec3::new(0.0, min.y, max.z)),
+            ];
+            let name = if occ_name.is_empty() { "YZ".into() } else { format!("{occ_name}/YZ") };
+            out.push((name, quad, t.origin_plane));
+        }
+    }
+
+    out
+}
+
+/// Component origin axes strictly spanning each component's bounding volume: (name, from, to, color).
+pub fn component_origin_axis_segments(app: &SolveApp) -> Vec<(String, Vec3, Vec3, Color32)> {
+    let s = &app.session;
+    let doc = s.placed_document();
+    let st = crate::open_meshing::shown_world(app);
+    let t = Tokens::get();
+    let default_h = origin_size(app.cam.half_height()) * 0.8;
+    let mut out = Vec::new();
+
+    for (comp_id, path, mat) in doc.placements() {
+        if path.is_empty() {
+            continue;
+        }
+
+        let Some(&leaf_occ_id) = path.last() else { continue };
+        let occ_name = doc.occurrences.iter().find(|o| o.id == leaf_occ_id).map(|o| o.name.as_str()).unwrap_or("");
+
+        if component_origin_item_hidden(s, comp_id, occ_name, None) {
+            continue;
+        }
+
+        let mut local_bb = solidcraft_engine::geom::Aabb3::EMPTY;
+        for b in st.bodies.iter().filter(|b| b.component == comp_id) {
+            let (m, _) = b.mesh_in_place();
+            local_bb = local_bb.union(&m.bounds());
+        }
+
+        let (min, max) = if !local_bb.is_empty() {
+            (local_bb.min, local_bb.max)
+        } else {
+            (Vec3::new(-default_h, -default_h, -default_h), Vec3::new(default_h, default_h, default_h))
+        };
+
+        let at = |p: Vec3| solidcraft_engine::doc::apply_point(&mat, p);
+
+        // X axis segment
+        if !component_origin_item_hidden(s, comp_id, occ_name, Some("X")) {
+            let name = if occ_name.is_empty() { "X".into() } else { format!("{occ_name}/X") };
+            out.push((name, at(Vec3::new(min.x, 0.0, 0.0)), at(Vec3::new(max.x, 0.0, 0.0)), t.axis_x));
+        }
+
+        // Y axis segment
+        if !component_origin_item_hidden(s, comp_id, occ_name, Some("Y")) {
+            let name = if occ_name.is_empty() { "Y".into() } else { format!("{occ_name}/Y") };
+            out.push((name, at(Vec3::new(0.0, min.y, 0.0)), at(Vec3::new(0.0, max.y, 0.0)), t.axis_y));
+        }
+
+        // Z axis segment
+        if !component_origin_item_hidden(s, comp_id, occ_name, Some("Z")) {
+            let name = if occ_name.is_empty() { "Z".into() } else { format!("{occ_name}/Z") };
+            out.push((name, at(Vec3::new(0.0, 0.0, min.z)), at(Vec3::new(0.0, 0.0, max.z)), t.axis_z));
+        }
+    }
+
+    out
 }
 
 /// Pick what is under `pos`: sketch points, sketch curves, vertices, edges and axes first, then
@@ -2962,6 +3195,14 @@ fn pick_hits(app: &SolveApp, proj: &Proj, pos: Pos2, other_sketch_points: bool, 
             }
         }
     }
+    for (name, a, b, _) in component_origin_axis_segments(app) {
+        if let (Some(a), Some(b)) = (proj.to_screen(a), proj.to_screen(b)) {
+            let dd = seg_dist(pos, a, b);
+            if dd < 5.0 && besta.wants(dd) {
+                besta.offer(dd, Hit::Axis { name });
+            }
+        }
+    }
     hits.extend(besta.hits());
     // Surfaces by depth: profiles (slightly preferred over a face they lie on), faces, planes.
     let mut surf: Vec<(f64, Hit)> = Vec::new();
@@ -3013,12 +3254,16 @@ fn pick_hits(app: &SolveApp, proj: &Proj, pos: Pos2, other_sketch_points: bool, 
             surf.push((t + slack, Hit::Plane { name, point: o + d * t }));
         }
     }
+    for (name, q, _) in component_origin_quads(app) {
+        if let Some(t) = ray_quad(o, d, &q) {
+            surf.push((t + slack, Hit::Plane { name, point: o + d * t }));
+        }
+    }
     surf.sort_by(|a, b| a.0.total_cmp(&b.0));
     hits.extend(surf.into_iter().map(|x| x.1));
     hits
 }
 
-/// The section cut shown now: the open Section Analysis dialog's plane, else the session's.
 /// The active sketch's display options (defaults when not sketching).
 pub fn active_view(app: &SolveApp) -> solidcraft_engine::sketch::SketchView {
     let st = crate::open_meshing::shown_world(app);
@@ -4127,6 +4372,7 @@ pub(crate) fn build_highlight(app: &SolveApp) -> GpuScene {
         let mut planes: Vec<(String, [Vec3; 4], Color32)> =
             origin_planes(app).into_iter().map(|(n, _, q)| (n.to_string(), q, t.origin_plane)).collect();
         planes.extend(construction_quads(app).into_iter().map(|(n, _, q)| (n, q, t.construction_plane)));
+        planes.extend(component_origin_quads(app));
         let through = app.picking_plane() || app.preferences.reference_geometry_through_bodies;
         for (name, q, base) in &planes {
             let (selected, hovered) = plane_state(name);
@@ -4169,6 +4415,19 @@ pub(crate) fn build_highlight(app: &SolveApp) -> GpuScene {
             while s < len {
                 let e = (s + dash).min(len);
                 reference_line(&mut sc, a.lerp(b, s / len).to_f32(), a.lerp(b, e / len).to_f32(), col, w, through);
+                s += dash * 1.6;
+            }
+        }
+        for (name, a, b, col) in component_origin_axis_segments(app) {
+            let on =
+                sel.iter().any(|x| matches!(x, Sel::Axis { name: n } if *n == name)) || matches!(hover, Some(Hit::Axis { name: n }) if *n == name);
+            let w = if on { 3.0 } else { 1.6 };
+            let len = a.dist(b);
+            let dash = size * 0.08;
+            let mut s = 0.0;
+            while s < len {
+                let e = (s + dash).min(len);
+                reference_line(&mut sc, a.lerp(b, s / len).to_f32(), a.lerp(b, e / len).to_f32(), c4(col), w, through);
                 s += dash * 1.6;
             }
         }
