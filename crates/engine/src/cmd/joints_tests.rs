@@ -2719,3 +2719,83 @@ fn driving_an_angle_reports_the_number_a_person_would_read() {
     let j = s.doc.assembly.joints.iter().find(|j| j.name == "Turn").unwrap();
     assert_ne!(j.values[0].to_degrees(), 30.0, "the stored angle keeps its bits");
 }
+
+#[test]
+fn new_joints_generate_type_prefixed_names_or_keep_custom_name() {
+    let mut s = two_cubes();
+    let (a, b) = (occ(&s, "A"), occ(&s, "B"));
+
+    // 1. Without name: revolute joint defaults to "Revolute Joint1"
+    let r1 = run(
+        &mut s,
+        "joint.create",
+        json!({
+            "type": "revolute",
+            "a": {"occurrence": a, "face": [5, 5, 10]},
+            "b": {"occurrence": b, "face": [25, 5, 0]}
+        }),
+    );
+    assert_eq!(r1["name"], "Revolute Joint1");
+
+    // 2. Without name: slider joint defaults to "Slider Joint1"
+    let r2 = run(
+        &mut s,
+        "joint.as_built",
+        json!({
+            "type": "slider",
+            "a": "A",
+            "b": "B"
+        }),
+    );
+    assert_eq!(r2["name"], "Slider Joint1");
+
+    // 3. Without name: pin-slot and point-on-plane use hyphens/spaces matching UI labels
+    let r_pin = run(
+        &mut s,
+        "joint.create",
+        json!({
+            "type": "pin_slot",
+            "a": {"occurrence": a, "point": [0, 0, 0], "z": [0, 0, 1], "x": [1, 0, 0]},
+            "b": {"occurrence": b, "point": [20, 0, 0], "z": [0, 0, 1], "x": [1, 0, 0]}
+        }),
+    );
+    assert_eq!(r_pin["name"], "Pin-slot Joint1");
+
+    let r_pop = run(
+        &mut s,
+        "joint.create",
+        json!({
+            "type": "point_on_plane",
+            "a": {"occurrence": a, "face": [5, 5, 10]},
+            "b": {"occurrence": b, "point": [25, 5, 0]}
+        }),
+    );
+    assert_eq!(r_pop["name"], "Point on plane Joint1");
+
+    // 4. With custom name: preserves custom name exactly
+    let r3 = run(
+        &mut s,
+        "joint.create",
+        json!({
+            "type": "rigid",
+            "name": "CustomRigid",
+            "a": {"occurrence": a, "face": [5, 5, 10]},
+            "b": {"occurrence": b, "face": [25, 5, 0]}
+        }),
+    );
+    assert_eq!(r3["name"], "CustomRigid");
+
+    // 5. Edit with long name (> 128 bytes): updates name consistently with create and as_built
+    let long_name = "LongJointNameExceeding128Bytes".repeat(5);
+    assert!(long_name.len() > 128);
+    let joint_id = r3["joint"].as_u64().unwrap();
+    run(
+        &mut s,
+        "joint.edit",
+        json!({
+            "joint": joint_id,
+            "name": format!("  {long_name}  ")
+        }),
+    );
+    assert_eq!(s.doc.assembly.joints.iter().find(|j| j.id == joint_id).unwrap().name, long_name);
+}

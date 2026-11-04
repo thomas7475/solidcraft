@@ -1470,3 +1470,63 @@ fn interference_checks_off_the_window_thread_and_drops_a_check_of_a_changed_desi
     compute(&mut app, true);
     assert_eq!(state(&app), (None, 0, false), "a check of the design before the change is dropped");
 }
+
+#[test]
+fn joint_dialog_applies_custom_name_or_falls_back_to_type_default() {
+    // 1. Empty name field: commands() generates payload without "name", backend creates "Rigid Joint1"
+    let mut app = two_boxes();
+    app.start("joint.create");
+    let mut d = app.dialog.clone().unwrap();
+    d.pick(&app.session, face_sel(&app.session, Vec3::new(10.0, 10.0, 10.0)).unwrap());
+    d.pick(&app.session, face_sel(&app.session, Vec3::new(40.0, 10.0, 0.0)).unwrap());
+    let cmds = apply_commands(&app, &d).unwrap();
+    assert_eq!(cmds[0].0, "joint.create");
+    assert!(cmds[0].1.get("name").is_none());
+    for (id, p) in cmds {
+        let r = app.run(&id, p).unwrap();
+        assert_eq!(r["name"], "Rigid Joint1");
+    }
+
+    // 2. Custom name in f.name: reset to fresh boxes so B is at its initial coordinates
+    let mut app = two_boxes();
+    app.start("joint.create");
+    let mut d = app.dialog.clone().unwrap();
+    d.pick(&app.session, face_sel(&app.session, Vec3::new(10.0, 10.0, 10.0)).unwrap());
+    d.pick(&app.session, face_sel(&app.session, Vec3::new(40.0, 10.0, 0.0)).unwrap());
+    if let Kind::Assembly(Asm::Joint(f)) = &mut d.kind {
+        f.name = "MyCustomJoint".into();
+    }
+    let cmds = apply_commands(&app, &d).unwrap();
+    assert_eq!(cmds[0].1["name"], "MyCustomJoint");
+    for (id, p) in cmds {
+        let r = app.run(&id, p).unwrap();
+        assert_eq!(r["name"], "MyCustomJoint");
+    }
+
+    // 3. Edit joint with a long name (> 128 bytes) updates the joint name
+    let long_name = "CustomJointNameLongerThan128Bytes".repeat(5);
+    assert!(long_name.len() > 128);
+    let joint_id = app.session.doc.assembly.joints[0].id;
+    let mut edit_d = edit_joint(&app, joint_id).unwrap();
+    if let Kind::Assembly(Asm::Joint(f)) = &mut edit_d.kind {
+        f.name = format!("  {long_name}  ");
+    }
+    let edit_cmds = apply_commands(&app, &edit_d).unwrap();
+    assert_eq!(edit_cmds[0].1["name"], long_name);
+    for (id, p) in edit_cmds {
+        app.run(&id, p).unwrap();
+    }
+    assert_eq!(app.session.doc.assembly.joints[0].name, long_name);
+
+    // 4. Edit joint with cleared name field resolves to the displayed default name instead of retaining old name
+    let mut clear_d = edit_joint(&app, joint_id).unwrap();
+    if let Kind::Assembly(Asm::Joint(f)) = &mut clear_d.kind {
+        f.name = "   ".into();
+    }
+    let clear_cmds = apply_commands(&app, &clear_d).unwrap();
+    assert_eq!(clear_cmds[0].1["name"], "Rigid Joint1");
+    for (id, p) in clear_cmds {
+        app.run(&id, p).unwrap();
+    }
+    assert_eq!(app.session.doc.assembly.joints[0].name, "Rigid Joint1");
+}
